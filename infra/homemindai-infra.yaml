@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  HomeMindAI infrastructure stack – Creates S3 bucket, SNS topic, IAM roles, Lambda stubs,
+  and optional SageMaker model + endpoint for AI event detection.
+
+Parameters:
+  ProjectSuffix:
+    Type: String
+    Default: homemind
+    Description: Suffix for resource naming
+  ArtifactBucketName:
+    Type: String
+    Description: Name of existing S3 bucket for Lambda and model artifacts
+  SageMakerModelS3Path:
+    Type: String
+    Default: ""
+    Description: Optional S3 path to SageMaker model tarball (s3://bucket/model.tar.gz)
+  SageMakerContainerImage:
+    Type: String
+    Default: ""
+    Description: Optional ECR container image for SageMaker model
+
+Resources:
+  ###########################################################
+  # 1. SNS Topic – Alerts & Notifications
+  ###########################################################
+  HomeMindSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "HomeMindAI-Alerts-${ProjectSuffix}"
+
+  ###########################################################
+  # 2. Log Group
+  ###########################################################
+  HomeMindLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/homemindai/${ProjectSuffix}"
+      RetentionInDays: 30
+
+  ###########################################################
+  # 3. IAM Roles
+  ###########################################################
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HomeMindAI-SageMakerRole-${ProjectSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HomeMindAI-LambdaRole-${ProjectSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AWSIoTDataAccess
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HomeMindAI-IoTRuleRole-${ProjectSuffix}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRuleSNSPublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: "*"
+
+  ###########################################################
+  # 4. Lambda Functions
+  ###########################################################
+  EventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "homemindai-event-handler-${ProjectSuffix}"
+      Handler: lambda_event_handler.handler
+      Runtime: python3.10
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: lambda/event_handler.zip
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref HomeMindSNSTopic
+
+  SageMakerInvokeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "homemindai-sagemaker-invoke-${ProjectSuffix}"
+      Handler: lambda_sagemaker_invoke.handler
+      Runtime: python3.10
+      Timeout: 20
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: lambda/sagemaker_invoke.zip
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT: !Sub "homemindai-endpoint-${ProjectSuffix}"
+
+  ###########################################################
+  # 5. IoT Rule – Forwards camera events to SNS
+  ###########################################################
+  HomeMindIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub "HomeMindAI-IoTRule-${ProjectSuffix}"
+      TopicRulePayload:
+        Sql: "SELECT * FROM 'homemind/+/events'"
+        Actions:
+          - sns:
+              targetArn: !Ref HomeMindSNSTopic
+              roleArn: !GetAtt IoTRuleRole.Arn
+        RuleDisabled: false
+        AwsIotSqlVersion: "2016-03-23"
+
+  ###########################################################
+  # 6. (Optional) SageMaker Model + Endpoint
+  ###########################################################
+  SageMakerModel:
+    Condition: CreateSageMakerResources
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      ModelName: !Sub "homemindai-model-${ProjectSuffix}"
+      PrimaryContainer:
+        Image: !Ref SageMakerContainerImage
+        ModelDataUrl: !Ref SageMakerModelS3Path
+
+  SageMakerEndpointConfig:
+    Condition: CreateSageMakerResources
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub "homemindai-epc-${ProjectSuffix}"
+      ProductionVariants:
+        - ModelName: !Ref SageMakerModel
+          VariantName: "AllTraffic"
+          InitialInstanceCount: 1
+          InstanceType: ml.t3.medium
+          InitialVariantWeight: 1.0
+
+  SageMakerEndpoint:
+    Condition: CreateSageMakerResources
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub "homemindai-endpoint-${ProjectSuffix}"
+      EndpointConfigName: !Ref SageMakerEndpointConfig
+
+Conditions:
+  CreateSageMakerResources: !And
+    - !Not [!Equals [!Ref SageMakerModelS3Path, ""]]
+    - !Not [!Equals [!Ref SageMakerContainerImage, ""]]
+
+Outputs:
+  SNSAlertTopicArn:
+    Description: SNS topic for notifications
+    Value: !Ref HomeMindSNSTopic
+  LambdaEventHandlerArn:
+    Description: Lambda for event processing
+    Value: !GetAtt EventHandlerFunction.Arn
+  SageMakerEndpointName:
+    Description: Created endpoint (if SageMaker params provided)
+    Value: !If [CreateSageMakerResources, !Ref SageMakerEndpoint, "N/A"]
+  IoTRuleName:
+    Description: IoT Rule Name
+    Value: !Ref HomeMindIoTRule
